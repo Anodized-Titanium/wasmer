@@ -7877,8 +7877,6 @@ dependencies = [
 [[package]]
 name = "webc"
 version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20b8b523112384e8c1caf77cffdd371ca7e0013779f081e6beafc537f5b5325d"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
