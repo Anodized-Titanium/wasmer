@@ -92,7 +92,7 @@ wasmer-wasix = { path = "./lib/wasix" }
 wasmer-sdk = { path = "./lib/sdk" }
 
 # Wasmer-owned crates
-webc = "=11.0.0"
+webc = "=12.0.0"
 shared-buffer = "0.1.4"
 loupe = "0.2.0"
 
@@ -362,9 +362,6 @@ tracing-subscriber = { workspace = true, default-features = false, features = [
 ] }
 reqwest = { workspace = true, features = ["blocking", "rustls"] }
 itertools.workspace = true
-
-[patch.crates-io]
-webc = { path = "/Users/syrusakbary/Development/pirita/crates/webc" }
 
 [features]
 # Don't add the compiler features in default, please add them on the Makefile
