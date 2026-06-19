@@ -232,32 +232,34 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                                 match data.view(&memory)? {
                                     FdWriteSourceView::Iovs(iter) => {
-                                        for buf in iter {
-                                            let buf = match buf {
-                                                Ok(buf) => buf,
-                                                Err(_) if written > 0 => break,
-                                                Err(err) => return Err(err),
-                                            };
-
-                                            let buf = match buf.access().map_err(mem_error_to_wasi)
-                                            {
-                                                Ok(buf) => buf,
-                                                Err(_) if written > 0 => break,
-                                                Err(err) => return Err(err),
-                                            };
-
-                                            let data = buf.as_ref();
-                                            let local_written = match handle.write(data).await {
-                                                Ok(s) => s,
-                                                Err(_) if written > 0 => break,
-                                                Err(err) => return Err(map_io_err(err)),
-                                            };
-
-                                            written += local_written;
-
-                                            if local_written < data.len() {
-                                                break;
+                                        let mut iter = iter.peekable();
+                                        match iter.next() {
+                                            Some(Ok(buf)) => {
+                                                let buf =
+                                                    buf.access().map_err(mem_error_to_wasi)?;
+                                                let data = buf.as_ref();
+                                                let local_written =
+                                                    handle.write(data).await.map_err(map_io_err)?;
+                                                written += local_written;
                                             }
+                                            Some(Err(err)) => return Err(err),
+                                            None => return Ok(0),
+                                        }
+                                        if iter.peek().is_some() {
+                                            let mut more = async || -> Option<()> {
+                                                for buf in iter {
+                                                    let buf = buf.ok()?.access().ok()?;
+                                                    let data = buf.as_ref();
+                                                    let local_written =
+                                                        handle.write(data).await.ok()?;
+                                                    written += local_written;
+                                                    if local_written < data.len() {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(())
+                                            };
+                                            let _suppressed_errors = more().await;
                                         }
                                     }
                                     FdWriteSourceView::Buffer(data) => {
@@ -299,39 +301,42 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                         match data.view(&memory)? {
                             FdWriteSourceView::Iovs(iter) => {
-                                for buf in iter {
-                                    let buf = match buf {
-                                        Ok(buf) => buf,
-                                        Err(_) if sent > 0 => break,
-                                        Err(err) => return Err(err),
-                                    };
-
-                                    let buf = match buf.access().map_err(mem_error_to_wasi) {
-                                        Ok(buf) => buf,
-                                        Err(_) if sent > 0 => break,
-                                        Err(err) => return Err(err),
-                                    };
-
-                                    let data = buf.as_ref();
-                                    let local_sent = match socket
-                                        .send(
-                                            tasks.deref(),
-                                            buf.as_ref(),
-                                            Some(timeout),
-                                            nonblocking,
-                                        )
-                                        .await
-                                    {
-                                        Ok(s) => s,
-                                        Err(_) if sent > 0 => break,
-                                        Err(err) => return Err(err),
-                                    };
-
-                                    sent += local_sent;
-
-                                    if local_sent < data.len() {
-                                        break;
+                                let mut iter = iter.peekable();
+                                match iter.next() {
+                                    Some(Ok(buf)) => {
+                                        let buf = buf.access().map_err(mem_error_to_wasi)?;
+                                        let data = buf.as_ref();
+                                        let local_sent = socket
+                                            .send(tasks.deref(), data, Some(timeout), nonblocking)
+                                            .await?;
+                                        sent += local_sent;
                                     }
+                                    Some(Err(err)) => return Err(err),
+                                    None => return Ok(0),
+                                }
+
+                                if iter.peek().is_some() {
+                                    let mut more = async || -> Option<()> {
+                                        for buf in iter {
+                                            let buf = buf.ok()?.access().ok()?;
+                                            let data = buf.as_ref();
+                                            let local_sent = socket
+                                                .send(
+                                                    tasks.deref(),
+                                                    data,
+                                                    Some(timeout),
+                                                    nonblocking,
+                                                )
+                                                .await
+                                                .ok()?;
+                                            sent += local_sent;
+                                            if local_sent < data.len() {
+                                                break;
+                                            }
+                                        }
+                                        Some(())
+                                    };
+                                    let _suppressed_errors = more().await;
                                 }
                             }
                             FdWriteSourceView::Buffer(data) => {
@@ -353,45 +358,45 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                     match wasi_try_ok_ok!(data.view(&memory)) {
                         FdWriteSourceView::Iovs(iter) => {
+                            let mut iter = iter.peekable();
                             let mut raise_sigpipe = false;
-                            for buf in iter {
-                                let buf = match buf {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let buf = match buf.access().map_err(mem_error_to_wasi) {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let write_result = std::io::Write::write(tx, buf.as_ref());
-                                let local_written = match write_result {
-                                    Ok(w) => w,
-                                    Err(e)
-                                        if written > 0
-                                            && e.kind() == std::io::ErrorKind::BrokenPipe =>
-                                    {
-                                        break;
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                        raise_sigpipe = true;
-                                        break;
-                                    }
-                                    Err(_) if written > 0 => break,
-                                    Err(e) => return Ok(Err(map_io_err(e))),
-                                };
-
-                                written += local_written;
-                                if local_written != buf.len() {
-                                    break;
+                            match iter.next() {
+                                Some(Ok(buf)) => {
+                                    let buf =
+                                        wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                    let write_result = std::io::Write::write(tx, buf.as_ref());
+                                    let local_written = match write_result {
+                                        Ok(w) => w,
+                                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                            raise_sigpipe = true;
+                                            0
+                                        }
+                                        Err(e) => return Ok(Err(map_io_err(e))),
+                                    };
+                                    written += local_written;
                                 }
+                                Some(Err(err)) => return Ok(Err(err)),
+                                None => return Ok(Ok(0)),
                             }
 
                             if raise_sigpipe {
                                 env.process.signal_process(Signal::Sigpipe);
                                 wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
+                            } else if iter.peek().is_some() {
+                                let mut more = || -> Option<()> {
+                                    for buf in iter {
+                                        let buf = buf.ok()?.access().ok()?;
+                                        let local_written =
+                                            std::io::Write::write(tx, buf.as_ref()).ok()?;
+                                        written += local_written;
+                                        if local_written < buf.len() {
+                                            break;
+                                        }
+                                    }
+                                    Some(())
+                                };
+                                let _suppressed_errors = more();
                             }
                         }
                         FdWriteSourceView::Buffer(data) => {
@@ -415,45 +420,45 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                     match wasi_try_ok_ok!(data.view(&memory)) {
                         FdWriteSourceView::Iovs(iter) => {
+                            let mut iter = iter.peekable();
                             let mut raise_sigpipe = false;
-                            for buf in iter {
-                                let buf = match buf {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let buf = match buf.access().map_err(mem_error_to_wasi) {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let write_result = std::io::Write::write(pipe, buf.as_ref());
-                                let local_written = match write_result {
-                                    Ok(w) => w,
-                                    Err(e)
-                                        if written > 0
-                                            && e.kind() == std::io::ErrorKind::BrokenPipe =>
-                                    {
-                                        break;
-                                    }
-                                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                        raise_sigpipe = true;
-                                        break;
-                                    }
-                                    Err(_) if written > 0 => break,
-                                    Err(e) => return Ok(Err(map_io_err(e))),
-                                };
-
-                                written += local_written;
-                                if local_written != buf.len() {
-                                    break;
+                            match iter.next() {
+                                Some(Ok(buf)) => {
+                                    let buf =
+                                        wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                    let write_result = std::io::Write::write(pipe, buf.as_ref());
+                                    let local_written = match write_result {
+                                        Ok(w) => w,
+                                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                            raise_sigpipe = true;
+                                            0
+                                        }
+                                        Err(e) => return Ok(Err(map_io_err(e))),
+                                    };
+                                    written += local_written;
                                 }
+                                Some(Err(err)) => return Ok(Err(err)),
+                                None => return Ok(Ok(0)),
                             }
 
                             if raise_sigpipe {
                                 env.process.signal_process(Signal::Sigpipe);
                                 wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
+                            } else if iter.peek().is_some() {
+                                let mut more = || -> Option<()> {
+                                    for buf in iter {
+                                        let buf = buf.ok()?.access().ok()?;
+                                        let local_written =
+                                            std::io::Write::write(pipe, buf.as_ref()).ok()?;
+                                        written += local_written;
+                                        if local_written < buf.len() {
+                                            break;
+                                        }
+                                    }
+                                    Some(())
+                                };
+                                let _suppressed_errors = more();
                             }
                         }
                         FdWriteSourceView::Buffer(data) => {
@@ -481,27 +486,40 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                     match wasi_try_ok_ok!(data.view(&memory)) {
                         FdWriteSourceView::Iovs(iter) => {
-                            for buf in iter {
-                                let buf = match buf {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let buf = match buf.access().map_err(mem_error_to_wasi) {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-
-                                let data = buf.as_ref();
-                                for chunk in data.chunks_exact(std::mem::size_of::<u64>()) {
-                                    inner.write(u64::from_ne_bytes([
-                                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
-                                        chunk[6], chunk[7],
-                                    ]));
+                            let mut iter = iter.peekable();
+                            match iter.next() {
+                                Some(Ok(buf)) => {
+                                    let buf =
+                                        wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                    let data = buf.as_ref();
+                                    for chunk in data.chunks_exact(std::mem::size_of::<u64>()) {
+                                        inner.write(u64::from_ne_bytes([
+                                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4],
+                                            chunk[5], chunk[6], chunk[7],
+                                        ]));
+                                    }
+                                    written += data.len();
                                 }
+                                Some(Err(err)) => return Ok(Err(err)),
+                                None => return Ok(Ok(0)),
+                            }
 
-                                written += data.len();
+                            if iter.peek().is_some() {
+                                let mut more = || -> Option<()> {
+                                    for buf in iter {
+                                        let buf = buf.ok()?.access().ok()?;
+                                        let data = buf.as_ref();
+                                        for chunk in data.chunks_exact(std::mem::size_of::<u64>()) {
+                                            inner.write(u64::from_ne_bytes([
+                                                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4],
+                                                chunk[5], chunk[6], chunk[7],
+                                            ]));
+                                        }
+                                        written += data.len();
+                                    }
+                                    Some(())
+                                };
+                                let _suppressed_errors = more();
                             }
                         }
                         FdWriteSourceView::Buffer(data) => {
@@ -532,27 +550,35 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                     match wasi_try_ok_ok!(data.view(&memory)) {
                         FdWriteSourceView::Iovs(iter) => {
-                            for buf in iter {
-                                let buf = match buf {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let buf = match buf.access().map_err(mem_error_to_wasi) {
-                                    Ok(buf) => buf,
-                                    Err(_) if written > 0 => break,
-                                    Err(err) => return Ok(Err(err)),
-                                };
-                                let local_written =
-                                    match std::io::Write::write(buffer, buf.as_ref()) {
-                                        Ok(w) => w,
-                                        Err(_) if written > 0 => break,
-                                        Err(e) => return Ok(Err(map_io_err(e))),
-                                    };
-                                written += local_written;
-                                if local_written != buf.len() {
-                                    break;
+                            let mut iter = iter.peekable();
+                            match iter.next() {
+                                Some(Ok(buf)) => {
+                                    let buf =
+                                        wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                                    let local_written = wasi_try_ok_ok!(
+                                        std::io::Write::write(buffer, buf.as_ref())
+                                            .map_err(map_io_err)
+                                    );
+                                    written += local_written;
                                 }
+                                Some(Err(err)) => return Ok(Err(err)),
+                                None => return Ok(Ok(0)),
+                            }
+
+                            if iter.peek().is_some() {
+                                let mut more = || -> Option<()> {
+                                    for buf in iter {
+                                        let buf = buf.ok()?.access().ok()?;
+                                        let local_written =
+                                            std::io::Write::write(buffer, buf.as_ref()).ok()?;
+                                        written += local_written;
+                                        if local_written < buf.len() {
+                                            break;
+                                        }
+                                    }
+                                    Some(())
+                                };
+                                let _suppressed_errors = more();
                             }
                         }
                         FdWriteSourceView::Buffer(data) => {
