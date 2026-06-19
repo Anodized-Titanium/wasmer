@@ -263,7 +263,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         }
                                     }
                                     FdWriteSourceView::Buffer(data) => {
-                                        written += handle.write(&data).await?;
+                                        written += handle.write(data).await?;
                                     }
                                 }
 
@@ -341,7 +341,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                             }
                             FdWriteSourceView::Buffer(data) => {
                                 sent += socket
-                                    .send(tasks.deref(), data.as_ref(), Some(timeout), nonblocking)
+                                    .send(tasks.deref(), data, Some(timeout), nonblocking)
                                     .await?;
                             }
                         }
