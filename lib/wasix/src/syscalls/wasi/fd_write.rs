@@ -1,5 +1,7 @@
 use std::task::Waker;
 
+use wasmer::WasmSliceIter;
+
 use super::*;
 #[cfg(feature = "journal")]
 use crate::{
@@ -124,6 +126,54 @@ pub(crate) enum FdWriteSource<'a, M: MemorySize> {
     Buffer(Cow<'a, [u8]>),
 }
 
+pub(crate) enum FdWriteSourceView<'src, 'mem, M: MemorySize> {
+    Iovs(FdWriteIovsView<'mem, M>),
+    Buffer(&'src [u8]),
+}
+
+pub(crate) struct FdWriteIovsView<'mem, M: MemorySize> {
+    memory: &'mem MemoryView<'mem>,
+    iter: WasmSliceIter<'mem, __wasi_ciovec_t<M>>,
+}
+
+impl<'mem, M: MemorySize> Iterator for FdWriteIovsView<'mem, M> {
+    type Item = Result<WasmSlice<'mem, u8>, Errno>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let iov = self.iter.next()?;
+
+        let iov = match iov.read().map_err(mem_error_to_wasi) {
+            Ok(iov) => iov,
+            Err(err) => return Some(Err(err)),
+        };
+
+        Some(
+            WasmPtr::<u8, M>::new(iov.buf)
+                .slice(self.memory, iov.buf_len)
+                .map_err(mem_error_to_wasi),
+        )
+    }
+}
+
+impl<'a, M: MemorySize> FdWriteSource<'a, M> {
+    pub(crate) fn view<'src, 'mem>(
+        &'src self,
+        memory: &'mem MemoryView<'mem>,
+    ) -> Result<FdWriteSourceView<'src, 'mem, M>, Errno> {
+        match self {
+            FdWriteSource::Iovs { iovs, iovs_len } => {
+                let iovs = iovs.slice(memory, *iovs_len).map_err(mem_error_to_wasi)?;
+
+                Ok(FdWriteSourceView::Iovs(FdWriteIovsView {
+                    memory,
+                    iter: iovs.iter(),
+                }))
+            }
+            FdWriteSource::Buffer(buf) => Ok(FdWriteSourceView::Buffer(buf.as_ref())),
+        }
+    }
+}
+
 #[allow(clippy::await_holding_lock)]
 pub(crate) fn fd_write_internal<M: MemorySize>(
     mut ctx: &mut FunctionEnvMut<'_, WasiEnv>,
@@ -180,34 +230,38 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
 
                                 let mut written = 0usize;
 
-                                match &data {
-                                    FdWriteSource::Iovs { iovs, iovs_len } => {
-                                        let iovs_arr = iovs
-                                            .slice(&memory, *iovs_len)
-                                            .map_err(mem_error_to_wasi)?;
-                                        let iovs_arr =
-                                            iovs_arr.access().map_err(mem_error_to_wasi)?;
-                                        for iovs in iovs_arr.iter() {
-                                            let buf = WasmPtr::<u8, M>::new(iovs.buf)
-                                                .slice(&memory, iovs.buf_len)
-                                                .map_err(mem_error_to_wasi)?
-                                                .access()
-                                                .map_err(mem_error_to_wasi)?;
-                                            let local_written =
-                                                match handle.write(buf.as_ref()).await {
-                                                    Ok(s) => s,
-                                                    Err(_) if written > 0 => break,
-                                                    Err(err) => return Err(map_io_err(err)),
-                                                };
+                                match data.view(&memory)? {
+                                    FdWriteSourceView::Iovs(iter) => {
+                                        for buf in iter {
+                                            let buf = match buf {
+                                                Ok(buf) => buf,
+                                                Err(_) if written > 0 => break,
+                                                Err(err) => return Err(err),
+                                            };
+
+                                            let buf = match buf.access().map_err(mem_error_to_wasi)
+                                            {
+                                                Ok(buf) => buf,
+                                                Err(_) if written > 0 => break,
+                                                Err(err) => return Err(err),
+                                            };
+
+                                            let data = buf.as_ref();
+                                            let local_written = match handle.write(data).await {
+                                                Ok(s) => s,
+                                                Err(_) if written > 0 => break,
+                                                Err(err) => return Err(map_io_err(err)),
+                                            };
+
                                             written += local_written;
-                                            if local_written != buf.len() {
+
+                                            if local_written < data.len() {
                                                 break;
                                             }
                                         }
                                     }
-                                    FdWriteSource::Buffer(data) => {
-                                        handle.write_all(data).await?;
-                                        written += data.len();
+                                    FdWriteSourceView::Buffer(data) => {
+                                        written += handle.write(&data).await?;
                                     }
                                 }
 
@@ -243,17 +297,22 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                     let res = __asyncify_light(env, None, async {
                         let mut sent = 0usize;
 
-                        match &data {
-                            FdWriteSource::Iovs { iovs, iovs_len } => {
-                                let iovs_arr =
-                                    iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)?;
-                                let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
-                                for iovs in iovs_arr.iter() {
-                                    let buf = WasmPtr::<u8, M>::new(iovs.buf)
-                                        .slice(&memory, iovs.buf_len)
-                                        .map_err(mem_error_to_wasi)?
-                                        .access()
-                                        .map_err(mem_error_to_wasi)?;
+                        match data.view(&memory)? {
+                            FdWriteSourceView::Iovs(iter) => {
+                                for buf in iter {
+                                    let buf = match buf {
+                                        Ok(buf) => buf,
+                                        Err(_) if sent > 0 => break,
+                                        Err(err) => return Err(err),
+                                    };
+
+                                    let buf = match buf.access().map_err(mem_error_to_wasi) {
+                                        Ok(buf) => buf,
+                                        Err(_) if sent > 0 => break,
+                                        Err(err) => return Err(err),
+                                    };
+
+                                    let data = buf.as_ref();
                                     let local_sent = match socket
                                         .send(
                                             tasks.deref(),
@@ -263,17 +322,19 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                         )
                                         .await
                                     {
-                                        Ok(sent) => sent,
+                                        Ok(s) => s,
                                         Err(_) if sent > 0 => break,
                                         Err(err) => return Err(err),
                                     };
+
                                     sent += local_sent;
-                                    if local_sent != buf.len() {
+
+                                    if local_sent < data.len() {
                                         break;
                                     }
                                 }
                             }
-                            FdWriteSource::Buffer(data) => {
+                            FdWriteSourceView::Buffer(data) => {
                                 sent += socket
                                     .send(tasks.deref(), data.as_ref(), Some(timeout), nonblocking)
                                     .await?;
@@ -290,29 +351,34 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 Kind::PipeTx { tx } => {
                     let mut written = 0usize;
 
-                    match &data {
-                        FdWriteSource::Iovs { iovs, iovs_len } => {
+                    match wasi_try_ok_ok!(data.view(&memory)) {
+                        FdWriteSourceView::Iovs(iter) => {
                             let mut raise_sigpipe = false;
-                            let iovs_arr = wasi_try_ok_ok!(
-                                iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
-                            );
-                            let iovs_arr =
-                                wasi_try_ok_ok!(iovs_arr.access().map_err(mem_error_to_wasi));
-                            for iovs in iovs_arr.iter() {
-                                let buf = wasi_try_ok_ok!(
-                                    WasmPtr::<u8, M>::new(iovs.buf)
-                                        .slice(&memory, iovs.buf_len)
-                                        .map_err(mem_error_to_wasi)
-                                );
-                                let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                            for buf in iter {
+                                let buf = match buf {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let buf = match buf.access().map_err(mem_error_to_wasi) {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
                                 let write_result = std::io::Write::write(tx, buf.as_ref());
                                 let local_written = match write_result {
                                     Ok(w) => w,
+                                    Err(e)
+                                        if written > 0
+                                            && e.kind() == std::io::ErrorKind::BrokenPipe =>
+                                    {
+                                        break;
+                                    }
                                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                        // Need to do this to avoid double borrow on ctx with iovs_arr
                                         raise_sigpipe = true;
                                         break;
                                     }
+                                    Err(_) if written > 0 => break,
                                     Err(e) => return Ok(Err(map_io_err(e))),
                                 };
 
@@ -322,15 +388,13 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 }
                             }
 
-                            drop(iovs_arr);
-
                             if raise_sigpipe {
                                 env.process.signal_process(Signal::Sigpipe);
                                 wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
                             }
                         }
-                        FdWriteSource::Buffer(data) => {
+                        FdWriteSourceView::Buffer(data) => {
                             match std::io::Write::write_all(tx, data) {
                                 Ok(()) => (),
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -349,29 +413,34 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 Kind::DuplexPipe { pipe } => {
                     let mut written = 0usize;
 
-                    match &data {
-                        FdWriteSource::Iovs { iovs, iovs_len } => {
+                    match wasi_try_ok_ok!(data.view(&memory)) {
+                        FdWriteSourceView::Iovs(iter) => {
                             let mut raise_sigpipe = false;
-                            let iovs_arr = wasi_try_ok_ok!(
-                                iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
-                            );
-                            let iovs_arr =
-                                wasi_try_ok_ok!(iovs_arr.access().map_err(mem_error_to_wasi));
-                            for iovs in iovs_arr.iter() {
-                                let buf = wasi_try_ok_ok!(
-                                    WasmPtr::<u8, M>::new(iovs.buf)
-                                        .slice(&memory, iovs.buf_len)
-                                        .map_err(mem_error_to_wasi)
-                                );
-                                let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
+                            for buf in iter {
+                                let buf = match buf {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let buf = match buf.access().map_err(mem_error_to_wasi) {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
                                 let write_result = std::io::Write::write(pipe, buf.as_ref());
                                 let local_written = match write_result {
                                     Ok(w) => w,
+                                    Err(e)
+                                        if written > 0
+                                            && e.kind() == std::io::ErrorKind::BrokenPipe =>
+                                    {
+                                        break;
+                                    }
                                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                        // Need to do this to avoid double borrow on ctx with iovs_arr
                                         raise_sigpipe = true;
                                         break;
                                     }
+                                    Err(_) if written > 0 => break,
                                     Err(e) => return Ok(Err(map_io_err(e))),
                                 };
 
@@ -381,15 +450,13 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 }
                             }
 
-                            drop(iovs_arr);
-
                             if raise_sigpipe {
                                 env.process.signal_process(Signal::Sigpipe);
                                 wasi_try_ok_ok!(WasiEnv::process_signals_and_exit(ctx)?);
                                 return Ok(Err(Errno::Pipe));
                             }
                         }
-                        FdWriteSource::Buffer(data) => {
+                        FdWriteSourceView::Buffer(data) => {
                             match std::io::Write::write_all(pipe, data) {
                                 Ok(()) => (),
                                 Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -412,38 +479,32 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 Kind::EventNotifications { inner } => {
                     let mut written = 0usize;
 
-                    match &data {
-                        FdWriteSource::Iovs { iovs, iovs_len } => {
-                            let iovs_arr = wasi_try_ok_ok!(
-                                iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
-                            );
-                            let iovs_arr =
-                                wasi_try_ok_ok!(iovs_arr.access().map_err(mem_error_to_wasi));
-                            for iovs in iovs_arr.iter() {
-                                let buf_len: usize = wasi_try_ok_ok!(
-                                    iovs.buf_len.try_into().map_err(|_| Errno::Inval)
-                                );
-                                let will_be_written = buf_len;
+                    match wasi_try_ok_ok!(data.view(&memory)) {
+                        FdWriteSourceView::Iovs(iter) => {
+                            for buf in iter {
+                                let buf = match buf {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let buf = match buf.access().map_err(mem_error_to_wasi) {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
 
-                                let val_cnt = buf_len / std::mem::size_of::<u64>();
-                                let val_cnt: M::Offset =
-                                    wasi_try_ok_ok!(val_cnt.try_into().map_err(|_| Errno::Inval));
-
-                                let vals = wasi_try_ok_ok!(
-                                    WasmPtr::<u64, M>::new(iovs.buf)
-                                        .slice(&memory, val_cnt as M::Offset)
-                                        .map_err(mem_error_to_wasi)
-                                );
-                                let vals =
-                                    wasi_try_ok_ok!(vals.access().map_err(mem_error_to_wasi));
-                                for val in vals.iter() {
-                                    inner.write(*val);
+                                let data = buf.as_ref();
+                                for chunk in data.chunks_exact(std::mem::size_of::<u64>()) {
+                                    inner.write(u64::from_ne_bytes([
+                                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
+                                        chunk[6], chunk[7],
+                                    ]));
                                 }
 
-                                written += will_be_written;
+                                written += data.len();
                             }
                         }
-                        FdWriteSource::Buffer(data) => {
+                        FdWriteSourceView::Buffer(data) => {
                             let cnt = data.len() / std::mem::size_of::<u64>();
                             for n in 0..cnt {
                                 let start = n * std::mem::size_of::<u64>();
@@ -459,6 +520,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                                 ];
                                 inner.write(u64::from_ne_bytes(data));
                             }
+                            written += data.len();
                         }
                     }
 
@@ -468,30 +530,32 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
                 Kind::Buffer { buffer } => {
                     let mut written = 0usize;
 
-                    match &data {
-                        FdWriteSource::Iovs { iovs, iovs_len } => {
-                            let iovs_arr = wasi_try_ok_ok!(
-                                iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)
-                            );
-                            let iovs_arr =
-                                wasi_try_ok_ok!(iovs_arr.access().map_err(mem_error_to_wasi));
-                            for iovs in iovs_arr.iter() {
-                                let buf = wasi_try_ok_ok!(
-                                    WasmPtr::<u8, M>::new(iovs.buf)
-                                        .slice(&memory, iovs.buf_len)
-                                        .map_err(mem_error_to_wasi)
-                                );
-                                let buf = wasi_try_ok_ok!(buf.access().map_err(mem_error_to_wasi));
-                                let local_written = wasi_try_ok_ok!(
-                                    std::io::Write::write(buffer, buf.as_ref()).map_err(map_io_err)
-                                );
+                    match wasi_try_ok_ok!(data.view(&memory)) {
+                        FdWriteSourceView::Iovs(iter) => {
+                            for buf in iter {
+                                let buf = match buf {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let buf = match buf.access().map_err(mem_error_to_wasi) {
+                                    Ok(buf) => buf,
+                                    Err(_) if written > 0 => break,
+                                    Err(err) => return Ok(Err(err)),
+                                };
+                                let local_written =
+                                    match std::io::Write::write(buffer, buf.as_ref()) {
+                                        Ok(w) => w,
+                                        Err(_) if written > 0 => break,
+                                        Err(e) => return Ok(Err(map_io_err(e))),
+                                    };
                                 written += local_written;
                                 if local_written != buf.len() {
                                     break;
                                 }
                             }
                         }
-                        FdWriteSource::Buffer(data) => {
+                        FdWriteSourceView::Buffer(data) => {
                             wasi_try_ok_ok!(
                                 std::io::Write::write_all(buffer, data).map_err(map_io_err)
                             );
